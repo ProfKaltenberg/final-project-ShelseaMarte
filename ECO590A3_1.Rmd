@@ -1,0 +1,285 @@
+---
+title: "Assignment 3: OLS Regression"
+author: "Shelsea Marte"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+<!--
+  resources used:
+     - Regression in R: https://www.geeksforgeeks.org/r-language/regression-analysis-in-r-programming/
+     - lm() function: https://www.rdocumentation.org/packages/stats/versions/3.6.2/topics/lm
+     - stargazer: https://cran.r-project.org/web/packages/stargazer/vignettes/stargazer.pdf
+     - dplyr filter: https://dplyr.tidyverse.org/reference/filter.html
+-->
+
+---
+
+**Research Question**
+
+**When everyday consumers are optimistic but financial markets are fearful — who turns out to be right?**
+
+I use the **Sentiment-VIX Gap** (`sent_vix_gap`) — a normalized measure of disagreement between consumer confidence (UMich Sentiment Index) and market fear (VIX) — to predict next-day SPY log returns.
+
+---
+
+**Setup**
+
+```{r setup, message=FALSE, warning=FALSE}
+# --- CHUNK OPTIONS ---
+# message=FALSE suppresses any package loading messages from appearing in the knitted output
+# warning=FALSE suppresses warnings (e.g. from package version conflicts) in the output
+
+# --- CONDITIONAL INSTALL ---
+# !require(tidyverse) returns TRUE if the package is NOT already installed
+# wrapping install.packages() inside if() means it only runs when the package is missing
+# this prevents R from reinstalling packages every time you knit, which slows rendering
+# repos = "http://cran.us.r-project.org" tells R which mirror to download from
+if (!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if (!require(stargazer)) install.packages("stargazer", repos = "http://cran.us.r-project.org")
+
+# --- LOAD LIBRARIES ---
+# library() loads an installed package into the current R session so its functions are available
+# tidyverse loads a collection of packages including:
+#   dplyr  → data manipulation (filter, mutate, %>% pipe, drop_na, lead)
+#   ggplot2 → plotting (not used here but loaded as part of tidyverse)
+#   tidyr  → data reshaping (drop_na is from here)
+#   readr  → fast CSV reading
+library(tidyverse)
+
+# stargazer produces publication-quality regression tables
+# it takes lm() model objects and formats their output into clean HTML/LaTeX/text tables
+library(stargazer)
+```
+
+---
+
+**Importing my data**
+
+```{r import}
+# --- SET WORKING DIRECTORY ---
+# setwd() tells R where to look for files (like our CSV) on your computer
+# dirname() extracts the folder path from a full file path
+#   e.g. dirname("/Users/shelsea/ECO590/Assignment3.Rmd") → "/Users/shelsea/ECO590"
+# rstudioapi::getSourceEditorContext()$path returns the full file path of the currently open .Rmd
+# combining these means: "set the working directory to wherever THIS file is saved"
+# this ensures read.csv() finds final_dataset_1.csv as long as it's in the same folder as the .Rmd
+setwd(dirname(rstudioapi::getSourceEditorContext()$path))
+
+# --- READ CSV ---
+# read.csv() reads a comma-separated values file from disk into an R data frame
+# "final_dataset_1.csv" is the file produced by the Python notebook in Assignment 1
+# the result is stored in df (short for data frame) — R's equivalent of a pandas DataFrame
+df <- read.csv("final_dataset_1.csv")
+
+# --- CONVERT DATE COLUMN ---
+# when R reads a CSV, date columns come in as character strings (e.g. "2010-01-04")
+# as.Date() converts those strings into proper R Date objects
+# this is required for any time-based operations and ensures dates sort/plot correctly
+df$date <- as.Date(df$date)
+
+# --- INSPECT STRUCTURE ---
+# str() prints a compact summary of the data frame:
+#   - number of rows and columns
+#   - name, data type, and first few values of each column
+# use this to confirm the date column is now type "Date" (not "chr") and all numeric columns look right
+str(df)
+```
+
+```{r preview}
+# head() displays the first 6 rows of the data frame in the console
+# this is a quick visual check that the data loaded correctly:
+# column names match what we expect, values look reasonable, no obvious import errors
+head(df)
+```
+
+```{r summary}
+# df[, c("log_return", "umich_sentiment", "vix", "sent_vix_gap")] selects only these 4 columns
+# the comma before c(...) means: keep ALL rows, but only these specific columns
+# summary() computes descriptive statistics for each selected column:
+#   Min, 1st Quartile, Median, Mean, 3rd Quartile, Max
+# this lets us verify the variables look realistic before running any regressions
+summary(df[, c("log_return", "umich_sentiment", "vix", "sent_vix_gap")])
+```
+
+---
+
+**Create Next-Day Return Variable**
+
+The dependent variable for all regressions is **next-day log return** — this makes the setup predictive. `lead(log_return, 1)` shifts the return series back by one row so each row's `return_next_day` is what happens the following trading day.
+
+```{r lead}
+# --- CREATE FORWARD-SHIFTED RETURN ---
+# lead(df$log_return, 1) shifts the log_return column FORWARD by 1 position
+# result: on the row for day t, return_next_day contains day t+1's log return
+# this is the key transformation: we want to predict TOMORROW's return using TODAY's variables
+# note: lead() is the opposite of lag() — lag() looks backward, lead() looks forward
+# lead() comes from the dplyr package (loaded via tidyverse above)
+df$return_next_day <- lead(df$log_return, 1)
+
+# --- DROP LAST ROW ---
+# the very last row of the data has no "tomorrow", so lead() puts NA there
+# %>% is the pipe operator from dplyr: it passes df into drop_na() as the first argument
+# drop_na(return_next_day) removes any row where return_next_day is NA
+# the result is stored back into df, overwriting it with the cleaned version
+df <- df %>% drop_na(return_next_day)
+
+# cat() prints a message to the console (like print, but without quotes around the output)
+# nrow(df) counts the total number of rows remaining after dropping the last row
+# \n is a newline character — moves the cursor to the next line after printing
+cat("Rows after creating next-day return:", nrow(df), "\n")
+```
+
+---
+
+**Regression 1 – Full Sample OLS (4 variables)**
+
+**Model:** `return_next_day ~ sent_vix_gap + umich_sentiment + vix + log_return`
+
+This baseline regression tests whether the sentiment-fear gap, along with its component variables and today's return, predicts tomorrow's return across the full dataset.
+
+```{r reg1}
+# --- FIT OLS REGRESSION ---
+# lm() stands for "linear model" — it fits an Ordinary Least Squares (OLS) regression
+# the formula syntax is: outcome_variable ~ predictor1 + predictor2 + ...
+#   return_next_day   = the dependent variable (what we are trying to predict)
+#   sent_vix_gap      = our new variable: normalized disagreement between consumers and markets
+#   umich_sentiment   = raw consumer sentiment index (UMich monthly reading)
+#   vix               = raw market fear index (CBOE VIX monthly average)
+#   log_return        = today's log return, included as a momentum/mean-reversion control
+# data = df tells lm() which data frame to pull the column names from
+# the result is stored in reg1 — an lm object containing all regression output
+reg1 <- lm(return_next_day ~ sent_vix_gap + umich_sentiment + vix + log_return,
+           data = df)
+
+# summary() applied to an lm object prints the full regression output:
+#   - Residuals: distribution of prediction errors
+#   - Coefficients table: estimate, standard error, t-statistic, p-value, and significance stars
+#   - Residual standard error: average size of the prediction error
+#   - R-squared and Adjusted R-squared: how much variance in the outcome the model explains
+#   - F-statistic: tests whether the model as a whole is better than a model with no predictors
+summary(reg1)
+```
+
+---
+
+**Regression 2 – Filtered Dataset: High Fear Periods Only**
+
+**Filter:** days where VIX is above its median — periods of elevated market fear.
+
+The idea: the sentiment-VIX gap may be a stronger predictor when markets are already fearful. If consumers stay optimistic during high-fear periods, that disagreement may be especially meaningful.
+
+```{r reg2}
+# --- COMPUTE MEDIAN VIX ---
+# median() computes the 50th percentile of all VIX values in the full dataset
+# this becomes our threshold: days above this value are classified as "high fear"
+median_vix <- median(df$vix)
+
+# round(median_vix, 2) rounds to 2 decimal places for a clean printed output
+# cat() prints the label and value together on one line
+cat("Median VIX:", round(median_vix, 2), "\n")
+
+# --- FILTER TO HIGH-FEAR DAYS ---
+# %>% pipes df into filter() — equivalent to writing: filter(df, vix > median_vix)
+# filter() from dplyr keeps only rows that satisfy the condition vix > median_vix
+# result: df_highfear contains only trading days where VIX was above its historical median
+# this creates a subset representing periods of elevated market stress
+df_highfear <- df %>% filter(vix > median_vix)
+
+# confirm how many rows are in the filtered subset (~half of the original, by definition of median)
+cat("Rows in high-fear subset:", nrow(df_highfear), "\n")
+
+# --- FIT REGRESSION ON HIGH-FEAR SUBSET ---
+# same formula as reg1: same four predictors, same dependent variable
+# the only difference is data = df_highfear instead of data = df
+# this means lm() estimates coefficients using ONLY the high-fear observations
+# comparing reg2 to reg1 tells us whether the gap is a stronger predictor during fearful markets
+reg2 <- lm(return_next_day ~ sent_vix_gap + umich_sentiment + vix + log_return,
+           data = df_highfear)
+
+# summary() prints the full regression output for this model
+# pay attention to whether sent_vix_gap's coefficient or significance changes vs. reg1
+summary(reg2)
+```
+
+---
+
+**Regression 3 – Preferred Regression**
+
+**Model:** `return_next_day ~ sent_vix_gap + log_return`
+
+This is my preferred model. I keep only the two predictors I care about: the sentiment-fear gap and today's return (which controls for momentum). Dropping `umich_sentiment` and `vix` separately also avoids multicollinearity, since they are both components of the gap variable.
+
+```{r reg3}
+# --- FIT PARSIMONIOUS PREFERRED MODEL ---
+# this model has only 2 predictors instead of 4:
+#   sent_vix_gap  = the main variable of interest (the disagreement measure)
+#   log_return    = controls for momentum (positive) or mean-reversion (negative)
+#
+# WHY drop umich_sentiment and vix?
+#   multicollinearity: sent_vix_gap is constructed FROM umich_sentiment and vix (z-scored and subtracted)
+#   including all three in the same regression means the predictors are highly correlated
+#   this inflates standard errors and makes individual coefficient estimates unreliable
+#   dropping the components and keeping only the composite variable solves this
+#
+# this model is more interpretable: the single coefficient on sent_vix_gap directly answers
+# the research question — does the consumer-vs-market disagreement predict next-day returns?
+reg3 <- lm(return_next_day ~ sent_vix_gap + log_return,
+           data = df)
+
+# summary() prints the full regression output
+# the p-value on sent_vix_gap is the key result: is the disagreement measure statistically significant?
+summary(reg3)
+```
+
+---
+
+**Stargazer Table**
+
+```{r table, results='asis'}
+# --- CHUNK OPTION: results='asis' ---
+# normally knitr wraps all output in code blocks
+# results='asis' tells knitr to pass the output through RAW — without wrapping it
+# this is required for stargazer's HTML table to render properly in the knitted document
+# without it, you would see raw HTML tags instead of a formatted table
+
+# --- STARGAZER TABLE ---
+# stargazer() takes multiple lm objects and arranges their results side by side in one table
+# reg1, reg2, reg3 = the three regression models to compare (one column each)
+# type = "html" formats the table as HTML, which renders correctly in .html output
+#   (use type = "latex" for PDF output, type = "text" for plain console output)
+# title = sets the caption displayed above the table
+# column.labels = labels shown above each model's column (replaces default "Model 1", "Model 2"...)
+# covariate.labels = human-readable names for each predictor row in the table
+#   order must match the order variables appear in the regression formulas
+# dep.var.labels = label shown above the dependent variable rows
+# digits = 5 means all numbers are shown to 5 decimal places
+#   (necessary because log return coefficients are very small numbers)
+# star.cutoffs = c(0.10, 0.05, 0.01) sets the p-value thresholds for significance stars:
+#   * = p < 0.10, ** = p < 0.05, *** = p < 0.01
+# notes = a footnote displayed below the table explaining key details
+# notes.align = "l" left-aligns the footnote text
+stargazer(reg1, reg2, reg3,
+          type = "html",
+          title = "OLS Regression Results: Predicting Next-Day SPY Returns",
+          column.labels = c("Full Sample", "High Fear Only", "Preferred"),
+          covariate.labels = c("Sentiment-VIX Gap", "UMich Sentiment",
+                               "VIX", "Log Return (today)"),
+          dep.var.labels = "Next-Day Log Return",
+          digits = 5,
+          star.cutoffs = c(0.10, 0.05, 0.01),
+          notes = "Standard errors in parentheses. High Fear = VIX above median (16.96).",
+          notes.align = "l")
+```
+
+---
+
+**Preferred Regression: Interpretation**
+
+My preferred regression is **Model 3**: `return_next_day ~ sent_vix_gap + log_return`.
+
+**`sent_vix_gap`:** This coefficient measures how much tomorrow's return changes for a one-unit increase in today's disagreement between consumer confidence and market fear. A negative coefficient means that when consumers are unusually optimistic relative to markets, tomorrow's return tends to be lower — suggesting overconfident consumers are the ones who are wrong and markets correct. A positive coefficient suggests market fear is overdone and optimistic consumers are right.
+
+**`log_return`:** This controls for short-term momentum or mean-reversion. A negative coefficient means markets tend to reverse the following day. A positive one means momentum continues.
+
+**Statistical significance:** The key question is whether `sent_vix_gap` is significant at the 5% level (p < 0.05). Even a small but significant coefficient is economically meaningful — it would imply that a simple disagreement measure between two public indices contains predictive information about next-day returns that is not already priced in.
